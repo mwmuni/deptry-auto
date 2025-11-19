@@ -66,6 +66,16 @@ _SKIPPED_PACKAGES = {
     "neopixel",
 }
 
+class PythonVersionPinned(RuntimeError):
+    """Raised when the project Python version has been pinned and installs must restart."""
+
+    def __init__(self, version: str):
+        super().__init__(f"Python pinned to {version}")
+        self.version = version
+
+
+_PINNED_PYTHON_VERSION: str | None = None
+
 _REQUIRES_PYTHON_REGEX = re.compile(r'^(\s*requires-python\s*=\s*")(.*?)(")\s*$', re.MULTILINE)
 
 
@@ -350,71 +360,77 @@ def main(argv: List[str] | None = None) -> None:
         print(f"Project path '{project_root}' is not a directory.")
         sys.exit(2)
 
-    print(f"Scanning '{project_root}' for missing dependencies...")
-    report = _run_deptry_scan(project_root)
-    missing_packages = _extract_missing_packages(report)
-    missing_packages, local_packages = _filter_local_packages(missing_packages, project_root)
-    missing_packages, skipped_packages = _filter_skipped_packages(missing_packages)
-
-    if local_packages:
-        print(
-            "Ignoring locally provided packages: "
-            + ", ".join(sorted(local_packages))
-        )
-
-    if skipped_packages:
-        print(
-            "Skipping packages that cannot be installed automatically: "
-            + ", ".join(sorted(skipped_packages))
-        )
-
-    if not missing_packages:
-        print("No missing dependencies found.")
-        return
-
-    print(f"Found missing dependencies: {', '.join(sorted(missing_packages))}")
     install_timeout = args.install_timeout if args.install_timeout > 0 else None
-    
-    if args.dry_run:
-        # Show what would be installed in dry-run mode
-        for package in sorted(missing_packages):
-            install_name = _candidate_install_names(package)[0]
-            if install_name != package:
-                print(
-                    f"[dry-run] uv add {install_name}  # resolved from '{package}'"
-                )
-            else:
-                print(f"[dry-run] uv add {package}")
-        print("Dry run complete. No dependencies were modified.")
-    else:
-        # Resolve all candidates first, then install in one batch
+    failures: List[str] = []
+
+    while True:
+        print(f"Scanning '{project_root}' for missing dependencies...")
+        report = _run_deptry_scan(project_root)
+        missing_packages = _extract_missing_packages(report)
+        missing_packages, local_packages = _filter_local_packages(missing_packages, project_root)
+        missing_packages, skipped_packages = _filter_skipped_packages(missing_packages)
+
+        if local_packages:
+            print(
+                "Ignoring locally provided packages: "
+                + ", ".join(sorted(local_packages))
+            )
+
+        if skipped_packages:
+            print(
+                "Skipping packages that cannot be installed automatically: "
+                + ", ".join(sorted(skipped_packages))
+            )
+
+        if not missing_packages:
+            print("No missing dependencies found.")
+            return
+
+        print(f"Found missing dependencies: {', '.join(sorted(missing_packages))}")
+
+        if args.dry_run:
+            for package in sorted(missing_packages):
+                install_name = _candidate_install_names(package)[0]
+                if install_name != package:
+                    print(
+                        f"[dry-run] uv add {install_name}  # resolved from '{package}'"
+                    )
+                else:
+                    print(f"[dry-run] uv add {package}")
+            print("Dry run complete. No dependencies were modified.")
+            return
+
         package_to_install: Dict[str, str] = {}
         for package in sorted(missing_packages):
             candidates = _candidate_install_names(package)
             package_to_install[package] = candidates[0]
-        
-        failures = _add_dependencies_batch(
-            package_to_install, project_root, install_timeout
-        )
-        
-        if failures:
-            print(
-                "Failed to add the following packages: "
-                + ", ".join(failures)
+
+        try:
+            failures = _add_dependencies_batch(
+                package_to_install, project_root, install_timeout
             )
-            # Check if build environment is needed
-            _report_build_requirements(project_root)
-            # Report any platform constraints that were discovered
-            if _PLATFORM_CONSTRAINTS:
-                print("\n[platforms] Platform constraints detected during installation:")
-                _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
-            sys.exit(1)
-        else:
-            print("Finished adding missing dependencies.")
-            # Report any platform constraints that were discovered
-            if _PLATFORM_CONSTRAINTS:
-                print("\n[platforms] Platform constraints detected during installation:")
-                _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
+            break
+        except PythonVersionPinned as exc:
+            print(
+                f"[python-version] Restarting installation under Python {exc.version} after pinning...\n"
+            )
+            continue
+
+    if failures:
+        print(
+            "Failed to add the following packages: "
+            + ", ".join(failures)
+        )
+        _report_build_requirements(project_root)
+        if _PLATFORM_CONSTRAINTS:
+            print("\n[platforms] Platform constraints detected during installation:")
+            _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
+        sys.exit(1)
+
+    print("Finished adding missing dependencies.")
+    if _PLATFORM_CONSTRAINTS:
+        print("\n[platforms] Platform constraints detected during installation:")
+        _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
 
 
 def _run_deptry_scan(project_root: Path) -> List[dict]:
@@ -1132,6 +1148,29 @@ def _get_current_python_version(project_root: Path) -> str | None:
         return None
 
 
+def _set_python_pin(project_root: Path, version: str | None) -> bool:
+    """Pin (or unpin) the project's Python version via uv."""
+    cmd = ["uv", "python", "pin"]
+    if version:
+        cmd.append(version)
+    else:
+        cmd.append("--rm")
+
+    result = subprocess.run(
+        cmd,
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        action = f"pin Python {version}" if version else "remove Python pin"
+        print(f"  [python-version] Failed to {action} (exit {result.returncode})")
+        if result.stderr:
+            print("  [python-version] " + result.stderr.strip())
+        return False
+    return True
+
+
 def _update_requires_python(project_root: Path, version: str) -> str | None:
     """Update requires-python in pyproject.toml to >=version. Returns original content if changed."""
     pyproject_path = project_root / "pyproject.toml"
@@ -1163,65 +1202,68 @@ def _restore_pyproject(project_root: Path, content: str) -> None:
     (project_root / "pyproject.toml").write_text(content, encoding="utf-8")
 
 
-def _try_downgrading_python(candidate: str, project_root: Path, timeout: int | None, no_build: bool = False) -> bool:
-    print(f"  [python-version] Checking if '{candidate}' works with older Python versions...")
-    
+def _try_downgrading_python(
+    candidate: str, project_root: Path, timeout: int | None, no_build: bool = False
+) -> bool:
+    """Attempt to pin an older Python version to satisfy installation constraints."""
+
+    global _PINNED_PYTHON_VERSION
+
+    print(f"  [python-version] Checking if '{candidate}' works with alternate Python versions...")
+
     current_python = _get_current_python_version(project_root)
-    
-    # Versions to try (descending order of preference)
-    # Assuming we are on a newer version (e.g. 3.14), try older stable ones
-    fallback_versions = ["3.12", "3.11", "3.10"]
-    
-    for version in fallback_versions:
+
+    preferred_versions: List[str] = []
+    if _PINNED_PYTHON_VERSION:
+        preferred_versions.append(_PINNED_PYTHON_VERSION)
+    for version in ["3.12", "3.11", "3.10"]:
+        if version not in preferred_versions:
+            preferred_versions.append(version)
+
+    for version in preferred_versions:
+        pin_changed = False
         if current_python and current_python.startswith(version):
-            continue
-            
-        print(f"  [python-version] Pinning Python {version} and retrying install...")
-        
-        # 1. Pin version
-        subprocess.run(
-            ["uv", "python", "pin", version],
-            cwd=project_root,
-            check=False,
-            capture_output=True
-        )
-        
-        # 2. Update pyproject.toml requires-python if needed
+            pass
+        else:
+            print(f"  [python-version] Pinning Python {version} and retrying install...")
+            if not _set_python_pin(project_root, version):
+                continue
+            pin_changed = True
+
         original_pyproject = _update_requires_python(project_root, version)
-        
-        # 3. Try install
-        if no_build:
-            # Attempt 1: Strict no-build (forces wheels for everything, including deps)
-            # This helps resolve to older versions that have wheels (e.g. scikit-image)
-            print(f"  [python-version] Trying strict wheel-only install for '{candidate}'...")
-            if _try_install_command(["uv", "add", "--no-build", candidate], candidate, candidate, project_root, timeout):
-                print(f"  [python-version] Successfully installed '{candidate}' (wheels only) with Python {version}")
+        success = False
+
+        try:
+            if no_build:
+                print(f"  [python-version] Trying strict wheel-only install for '{candidate}'...")
+                if _try_install_command(["uv", "add", "--no-build", candidate], candidate, candidate, project_root, timeout):
+                    success = True
+                else:
+                    print("  [python-version] Strict wheel install failed. Retrying with --no-build-package...")
+                    if _try_install_command(["uv", "add", "--no-build-package", candidate, candidate], candidate, candidate, project_root, timeout):
+                        success = True
+            else:
+                if _try_install_command(["uv", "add", candidate], candidate, candidate, project_root, timeout):
+                    success = True
+
+            if success:
+                was_new_pin = pin_changed or (_PINNED_PYTHON_VERSION and _PINNED_PYTHON_VERSION != version)
+                _PINNED_PYTHON_VERSION = version
+                if was_new_pin:
+                    print(f"  [python-version] Project pinned to Python {version}; restarting installs for consistency...")
+                    raise PythonVersionPinned(version)
                 return True
 
-            # Attempt 2: Relaxed no-build (only candidate must be wheel)
-            # If strict failed (maybe some other dep needs build), try allowing deps to build
-            print("  [python-version] Strict wheel install failed. Retrying with --no-build-package...")
-            if _try_install_command(["uv", "add", "--no-build-package", candidate, candidate], candidate, candidate, project_root, timeout):
-                print(f"  [python-version] Successfully installed '{candidate}' with Python {version}")
-                return True
-        else:
-            # Standard install (allowing build)
-            if _try_install_command(["uv", "add", candidate], candidate, candidate, project_root, timeout):
-                print(f"  [python-version] Successfully installed '{candidate}' with Python {version}")
-                return True
-        
-        # Revert changes if failed
-        if original_pyproject:
-            _restore_pyproject(project_root, original_pyproject)
-            
-    # Restore original python version if we failed all attempts
-    if current_python:
-        print(f"  [python-version] Failed to find compatible Python version. Restoring {current_python}...")
-        subprocess.run(
-            ["uv", "python", "pin", current_python],
-            cwd=project_root,
-            check=False,
-            capture_output=True
-        )
-        
+        finally:
+            if not success:
+                if original_pyproject:
+                    _restore_pyproject(project_root, original_pyproject)
+                if pin_changed:
+                    # Revert pin on failure
+                    if current_python:
+                        _set_python_pin(project_root, current_python)
+                    else:
+                        _set_python_pin(project_root, None)
+
+    print("  [python-version] No compatible Python version found via pinning strategy.")
     return False
