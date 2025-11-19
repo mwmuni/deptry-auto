@@ -210,7 +210,8 @@ def _add_dependencies_batch(
 ) -> List[str]:
     """Install all packages with smart fallback to individual installs on failure."""
     install_names = list(package_to_install.values())
-    print(f"Adding dependencies via uv: {', '.join(install_names)}")
+    print(f"\n[batch] Adding {len(install_names)} dependencies via uv: {', '.join(install_names)}")
+    print(f"[batch] Running: uv add {' '.join(install_names)}")
     
     try:
         result = subprocess.run(
@@ -227,9 +228,10 @@ def _add_dependencies_batch(
         return _add_dependencies_individually(package_to_install, project_root, timeout)
     
     if result.returncode == 0:
+        print(f"[batch] ✓ All {len(install_names)} packages installed successfully")
         return []
     
-    # Batch failed; try to identify which packages are problematic
+    print(f"[batch] ✗ Batch install failed (exit code {result.returncode})")
     # and retry with only the viable ones
     problematic_packages = _identify_problematic_packages_in_batch(
         result, package_to_install
@@ -244,17 +246,17 @@ def _add_dependencies_batch(
         
         if viable_packages:
             print(
-                f"Skipping packages with unresolvable dependencies: "
-                f"{', '.join(problematic_packages)}"
+                f"[batch] Identified unresolvable packages: {', '.join(problematic_packages)}"
             )
-            print("Retrying batch installation with remaining packages...")
+            print(f"[batch] Retrying batch with {len(viable_packages)} remaining packages...")
             failures = _add_dependencies_batch(viable_packages, project_root, timeout)
             # Add the skipped packages to the failures list
             failures.extend(problematic_packages)
             return failures
     
     # Couldn't identify specific problematic packages, try individually
-    print("Batch installation failed. Attempting individual package installations...")
+    print("[batch] Could not identify specific problematic packages")
+    print(f"[individual] Attempting to install {len(package_to_install)} packages individually...")
     return _add_dependencies_individually(package_to_install, project_root, timeout)
 
 
@@ -263,9 +265,14 @@ def _add_dependencies_individually(
 ) -> List[str]:
     """Install packages individually with candidate resolution."""
     failures: List[str] = []
-    for package, install_name in package_to_install.items():
+    total = len(package_to_install)
+    for idx, (package, install_name) in enumerate(package_to_install.items(), 1):
+        print(f"\n[individual] [{idx}/{total}] Installing '{package}' as '{install_name}'...")
         if not _try_install_with_candidates(package, install_name, project_root, timeout):
+            print(f"[individual] [{idx}/{total}] ✗ Failed to install '{package}'")
             failures.append(package)
+        else:
+            print(f"[individual] [{idx}/{total}] ✓ Successfully installed '{package}'")
     return failures
 
 
@@ -303,15 +310,14 @@ def _try_install_with_candidates(
     candidates.insert(0, preferred_name)
     
     attempted: List[str] = []
-    for candidate in candidates:
+    for candidate_idx, candidate in enumerate(candidates, 1):
         attempted.append(candidate)
+        print(f"  [candidate {candidate_idx}/{len(candidates)}] Trying: uv add {candidate}")
         if _try_install_candidate(candidate, package, project_root, timeout):
             return True
 
     print(
-        "Exhausted install candidates for '"
-        + package
-        + "': "
+        f"  [candidates] Exhausted all {len(attempted)} candidates for '{package}': "
         + ", ".join(attempted)
     )
     return False
@@ -378,7 +384,9 @@ def _try_install_command(
     cmd: List[str], candidate: str, original_package: str, project_root: Path, timeout: int | None
 ) -> bool:
     """Execute an install command and return success status."""
+    cmd_str = " ".join(cmd)
     try:
+        print(f"    [exec] {cmd_str}")
         result = subprocess.run(
             cmd,
             cwd=project_root,
@@ -388,14 +396,16 @@ def _try_install_command(
         )
     except subprocess.TimeoutExpired:
         print(
-            f"Timed out after {timeout}s while installing '{candidate}'."
+            f"    [timeout] Timed out after {timeout}s while installing '{candidate}'."
         )
         return False
     
     _relay_process_output(result)
     if result.returncode == 0:
         if candidate != original_package:
-            print(f"Installed '{original_package}' using PyPI project '{candidate}'.")
+            print(f"    [success] Installed '{original_package}' using '{candidate}'")
+        else:
+            print(f"    [success] Installed '{candidate}'")
         return True
     
     return False
