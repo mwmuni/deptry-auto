@@ -392,10 +392,10 @@ def _candidate_install_names(package: str) -> List[str]:
         seen.add(key)
         names.append(candidate)
 
-    add(package)
     override = _PACKAGE_NAME_OVERRIDES.get(_normalized_key(package))
     if override:
         add(override)
+    add(package)
     add(_normalize_import_name(package))
     add(package.replace("_", "-"))
     add(package.replace("-", "_"))
