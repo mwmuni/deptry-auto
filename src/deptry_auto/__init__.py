@@ -116,10 +116,11 @@ def main(argv: List[str] | None = None) -> None:
         return
 
     print(f"Found missing dependencies: {', '.join(sorted(missing_packages))}")
-    failures: List[str] = []
     install_timeout = args.install_timeout if args.install_timeout > 0 else None
-    for package in sorted(missing_packages):
-        if args.dry_run:
+    
+    if args.dry_run:
+        # Show what would be installed in dry-run mode
+        for package in sorted(missing_packages):
             install_name = _candidate_install_names(package)[0]
             if install_name != package:
                 print(
@@ -127,20 +128,26 @@ def main(argv: List[str] | None = None) -> None:
                 )
             else:
                 print(f"[dry-run] uv add {package}")
-            continue
-        if not _add_dependency(package, project_root, install_timeout):
-            failures.append(package)
-
-    if args.dry_run:
         print("Dry run complete. No dependencies were modified.")
-    elif failures:
-        print(
-            "Failed to add the following packages: "
-            + ", ".join(failures)
-        )
-        sys.exit(1)
     else:
-        print("Finished adding missing dependencies.")
+        # Resolve all candidates first, then install in one batch
+        package_to_install: Dict[str, str] = {}
+        for package in sorted(missing_packages):
+            candidates = _candidate_install_names(package)
+            package_to_install[package] = candidates[0]
+        
+        failures = _add_dependencies_batch(
+            package_to_install, project_root, install_timeout
+        )
+        
+        if failures:
+            print(
+                "Failed to add the following packages: "
+                + ", ".join(failures)
+            )
+            sys.exit(1)
+        else:
+            print("Finished adding missing dependencies.")
 
 
 def _run_deptry_scan(project_root: Path) -> List[dict]:
@@ -198,42 +205,61 @@ def _extract_missing_packages(report: Iterable[dict]) -> Set[str]:
     return missing
 
 
-def _add_dependency(
-    package: str, project_root: Path, timeout: int | None
+def _add_dependencies_batch(
+    package_to_install: Dict[str, str], project_root: Path, timeout: int | None
+) -> List[str]:
+    """Install all packages with fallback to individual installs on failure."""
+    install_names = list(package_to_install.values())
+    print(f"Adding dependencies via uv: {', '.join(install_names)}")
+    
+    try:
+        result = subprocess.run(
+            ["uv", "add"] + install_names,
+            cwd=project_root,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Timed out after {timeout}s while installing dependencies."
+        )
+        print("Attempting individual package installations...")
+        return _add_dependencies_individually(package_to_install, project_root, timeout)
+    
+    if result.returncode == 0:
+        return []
+    
+    # Batch failed; try individual packages to identify which ones actually fail
+    print("Batch installation failed. Attempting individual package installations...")
+    return _add_dependencies_individually(package_to_install, project_root, timeout)
+
+
+def _add_dependencies_individually(
+    package_to_install: Dict[str, str], project_root: Path, timeout: int | None
+) -> List[str]:
+    """Install packages individually with candidate resolution."""
+    failures: List[str] = []
+    for package, install_name in package_to_install.items():
+        if not _try_install_with_candidates(package, install_name, project_root, timeout):
+            failures.append(package)
+    return failures
+
+
+def _try_install_with_candidates(
+    package: str, preferred_name: str, project_root: Path, timeout: int | None
 ) -> bool:
-    print(f"Adding dependency '{package}' via uv...")
+    """Try to install a package with candidate resolution."""
     candidates = _candidate_install_names(package)
+    # Prefer the already-resolved name first
+    if preferred_name in candidates:
+        candidates.remove(preferred_name)
+    candidates.insert(0, preferred_name)
+    
     attempted: List[str] = []
     for candidate in candidates:
         attempted.append(candidate)
-        try:
-            result = subprocess.run(
-                ["uv", "add", candidate],
-                cwd=project_root,
-                text=True,
-                capture_output=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired as timeout_error:
-            _relay_timeout_output(timeout_error)
-            print(
-                f"Timed out after {timeout}s while installing '{candidate}'."
-                " Trying another candidate..."
-            )
-            continue
-
-        _relay_process_output(result)
-        if result.returncode == 0:
-            if candidate != package:
-                print(f"Installed '{package}' using PyPI project '{candidate}'.")
+        if _try_install_candidate(candidate, package, project_root, timeout):
             return True
-        if not _looks_like_missing_distribution(result):
-            print(f"uv add exited with {result.returncode} for '{candidate}'.")
-            return False
-        print(
-            f"Package '{candidate}' was not found on PyPI."
-            " Trying another candidate..."
-        )
 
     print(
         "Exhausted install candidates for '"
@@ -242,6 +268,78 @@ def _add_dependency(
         + ", ".join(attempted)
     )
     return False
+
+
+def _try_install_candidate(
+    candidate: str, original_package: str, project_root: Path, timeout: int | None
+) -> bool:
+    """Try to install a single candidate with fallback strategies."""
+    # Try basic install first
+    if _try_install_command(["uv", "add", candidate], candidate, original_package, project_root, timeout):
+        return True
+    
+    # If it failed, check what kind of failure
+    try:
+        result = subprocess.run(
+            ["uv", "add", candidate],
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Timed out after {timeout}s while installing '{candidate}'."
+            " Trying another candidate..."
+        )
+        return False
+    
+    # Check if it's a platform/wheel compatibility issue
+    if _looks_like_platform_error(result):
+        print(f"Platform compatibility issue with '{candidate}'. Trying without pre-built wheels...")
+        # Try with --no-build to allow building from source
+        if _try_install_command(["uv", "add", "--no-build", candidate], candidate, original_package, project_root, timeout):
+            return True
+        print(f"Failed to build '{candidate}' from source.")
+    
+    # Check if it's a missing distribution
+    if not _looks_like_missing_distribution(result):
+        print(f"uv add exited with {result.returncode} for '{candidate}'.")
+        return False
+    
+    print(
+        f"Package '{candidate}' was not found on PyPI."
+        " Trying another candidate..."
+    )
+    return False
+
+
+def _try_install_command(
+    cmd: List[str], candidate: str, original_package: str, project_root: Path, timeout: int | None
+) -> bool:
+    """Execute an install command and return success status."""
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"Timed out after {timeout}s while installing '{candidate}'."
+        )
+        return False
+    
+    _relay_process_output(result)
+    if result.returncode == 0:
+        if candidate != original_package:
+            print(f"Installed '{original_package}' using PyPI project '{candidate}'.")
+        return True
+    
+    return False
+
 
 
 def _filter_local_packages(
@@ -458,6 +556,19 @@ def _looks_like_missing_distribution(result: subprocess.CompletedProcess[str]) -
         "no matching distribution found",
         "could not find a version",
         "unsatisfiable",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _looks_like_platform_error(result: subprocess.CompletedProcess[str]) -> bool:
+    """Check if the error is due to platform/wheel compatibility issues."""
+    message = (result.stdout or "") + "\n" + (result.stderr or "")
+    lowered = message.casefold()
+    keywords = [
+        "doesn't have a source distribution or wheel for the current platform",
+        "no wheels found",
+        "no matching distribution found for your python version",
+        "only has wheels for the following platforms",
     ]
     return any(keyword in lowered for keyword in keywords)
 
