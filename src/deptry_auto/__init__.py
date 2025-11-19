@@ -294,6 +294,19 @@ def _try_install_candidate(
         )
         return False
     
+    # Check if it's an unresolvable dependency issue - skip this candidate
+    if _looks_like_unresolvable_dependency(result):
+        print(f"Cannot resolve dependencies for '{candidate}'.")
+        print("Trying another candidate...")
+        return False
+    
+    # Check if it's a build failure - skip this candidate and try next
+    if _looks_like_build_failure(result):
+        print(f"Build failure with '{candidate}' (compilation errors).")
+        print("This package may not have pre-built wheels for your platform.")
+        print("Trying another candidate...")
+        return False
+    
     # Check if it's a platform/wheel compatibility issue
     if _looks_like_platform_error(result):
         print(f"Platform compatibility issue with '{candidate}'. Trying without pre-built wheels...")
@@ -569,6 +582,36 @@ def _looks_like_platform_error(result: subprocess.CompletedProcess[str]) -> bool
         "no wheels found",
         "no matching distribution found for your python version",
         "only has wheels for the following platforms",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _looks_like_build_failure(result: subprocess.CompletedProcess[str]) -> bool:
+    """Check if the error is due to a build failure (compilation errors, etc.)."""
+    message = (result.stdout or "") + "\n" + (result.stderr or "")
+    lowered = message.casefold()
+    keywords = [
+        "error c",  # C++ compiler errors
+        "fatal error",
+        "compilation failed",
+        "build stopped",
+        "ninja: build stopped",
+        "meson compilation",
+        "error during compilation",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _looks_like_unresolvable_dependency(result: subprocess.CompletedProcess[str]) -> bool:
+    """Check if the error is due to unresolvable transitive dependencies."""
+    message = (result.stdout or "") + "\n" + (result.stderr or "")
+    lowered = message.casefold()
+    keywords = [
+        "no solution found when resolving dependencies",
+        "unsatisfiable requirements",
+        "because",  # uv uses "because" in dependency resolution explanations
+        "can't be installed because",
+        "doesn't have a source distribution or wheel for the current platform",
     ]
     return any(keyword in lowered for keyword in keywords)
 

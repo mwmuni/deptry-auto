@@ -1,6 +1,6 @@
 [project]
 name = "deptry-auto"
-version = "0.2.11"
+version = "0.2.12"
 description = "Automatically add missing dependencies found by deptry using uv."
 readme = "README.md"
 authors = [
