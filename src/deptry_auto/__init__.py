@@ -66,6 +66,8 @@ _SKIPPED_PACKAGES = {
     "neopixel",
 }
 
+_REQUIRES_PYTHON_REGEX = re.compile(r'^(\s*requires-python\s*=\s*")(.*?)(")\s*$', re.MULTILINE)
+
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -593,19 +595,26 @@ def _try_install_candidate(
     candidate: str, original_package: str, project_root: Path, timeout: int | None
 ) -> bool:
     """Try to install a single candidate with fallback strategies."""
-    # Try basic install first
+    
+    # Strategy 0: Try to install pre-built wheel first (no build)
+    # This prioritizes Conda/wheels and avoids slow/failed builds if possible.
+    print(f"  [fast-path] Trying to install '{candidate}' using pre-built wheels...")
+    if _try_install_command(["uv", "add", "--no-build", candidate], candidate, original_package, project_root, timeout):
+        return True
+    
+    print("  [fast-path] Pre-built wheel not found or not compatible. Falling back to build...")
+
+    # Try basic install (allowing build)
     if _try_install_command(["uv", "add", candidate], candidate, original_package, project_root, timeout):
         return True
     
     # If it failed, check what kind of failure
     try:
-        result = subprocess.run(
+        result = _run_command_streaming(
             ["uv", "add", candidate],
             cwd=project_root,
-            text=True,
-            capture_output=True,
             timeout=timeout,
-            env=os.environ,
+            env=dict(os.environ),
         )
     except subprocess.TimeoutExpired:
         print(
@@ -645,12 +654,10 @@ def _try_install_candidate(
         print("  [robust-build] Installing modern build dependencies (Cython, NumPy, etc.)...")
         try:
             # We use 'uv pip install' to install into the current environment
-            subprocess.run(
+            _run_command_streaming(
                 ["uv", "pip", "install", "Cython>=3.0.0", "numpy>=2.0.0", "setuptools>=65.0.0", "wheel", "meson-python", "ninja"],
                 cwd=project_root,
-                check=False,
-                capture_output=True,
-                env=os.environ
+                env=dict(os.environ)
             )
         except Exception:
             pass 
@@ -675,6 +682,10 @@ def _try_install_candidate(
         if _try_install_command(["uv", "add", "--no-build", candidate], candidate, original_package, project_root, timeout):
             return True
         print(f"Failed to build '{candidate}' from source.")
+
+        # Try downgrading Python version
+        if _try_downgrading_python(candidate, project_root, timeout):
+            return True
     
     # Check if it's a missing distribution
     if not _looks_like_missing_distribution(result):
@@ -695,13 +706,11 @@ def _try_install_command(
     cmd_str = " ".join(cmd)
     try:
         print(f"    [exec] {cmd_str}")
-        result = subprocess.run(
+        result = _run_command_streaming(
             cmd,
             cwd=project_root,
-            text=True,
-            capture_output=True,
             timeout=timeout,
-            env=os.environ,
+            env=dict(os.environ),
         )
     except subprocess.TimeoutExpired:
         print(
@@ -1057,3 +1066,131 @@ def _is_within_project(path: Path, project_root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _run_command_streaming(
+    cmd: List[str],
+    cwd: Path,
+    timeout: int | None = None,
+    env: Dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    """Run a command while streaming output to stdout, capturing it for the result."""
+    process = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,  # Merge stderr into stdout
+        text=True,
+        env=env,
+        encoding="utf-8",
+        errors="replace",
+    )
+    
+    output_lines = []
+    try:
+        if process.stdout:
+            for line in process.stdout:
+                print(line, end="")
+                output_lines.append(line)
+        
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        raise
+    
+    stdout_content = "".join(output_lines)
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=process.returncode,
+        stdout=stdout_content,
+        stderr="" # stderr is merged into stdout
+    )
+
+
+def _get_current_python_version(project_root: Path) -> str | None:
+    try:
+        with open(project_root / ".python-version", "r") as f:
+            return f.read().strip()
+    except FileNotFoundError:
+        return None
+
+
+def _update_requires_python(project_root: Path, version: str) -> str | None:
+    """Update requires-python in pyproject.toml to >=version. Returns original content if changed."""
+    pyproject_path = project_root / "pyproject.toml"
+    try:
+        content = pyproject_path.read_text(encoding="utf-8")
+        
+        # Check current requirement
+        match = _REQUIRES_PYTHON_REGEX.search(content)
+        if not match:
+            return None
+            
+        current_req = match.group(2)
+        # Simple heuristic: if we are downgrading, we likely need to relax the constraint
+        # e.g. if it was >=3.14 and we want 3.12, we should make it >=3.12
+        
+        new_req = f">={version}"
+        if current_req == new_req:
+            return None
+            
+        new_content = _REQUIRES_PYTHON_REGEX.sub(lambda m: f'{m.group(1)}{new_req}{m.group(3)}', content)
+        pyproject_path.write_text(new_content, encoding="utf-8")
+        return content
+    except Exception as e:
+        print(f"  [warn] Failed to update requires-python: {e}")
+        return None
+
+
+def _restore_pyproject(project_root: Path, content: str) -> None:
+    (project_root / "pyproject.toml").write_text(content, encoding="utf-8")
+
+
+def _try_downgrading_python(candidate: str, project_root: Path, timeout: int | None) -> bool:
+    print(f"  [python-version] Checking if '{candidate}' works with older Python versions...")
+    
+    current_python = _get_current_python_version(project_root)
+    
+    # Versions to try (descending order of preference)
+    # Assuming we are on a newer version (e.g. 3.14), try older stable ones
+    fallback_versions = ["3.12", "3.11", "3.10"]
+    
+    for version in fallback_versions:
+        if current_python and current_python.startswith(version):
+            continue
+            
+        print(f"  [python-version] Pinning Python {version} and retrying install...")
+        
+        # 1. Pin version
+        subprocess.run(
+            ["uv", "python", "pin", version],
+            cwd=project_root,
+            check=False,
+            capture_output=True
+        )
+        
+        # 2. Update pyproject.toml requires-python if needed
+        original_pyproject = _update_requires_python(project_root, version)
+        
+        # 3. Try install
+        # We use the basic install command here. If it works, uv will handle the rest.
+        # We pass original_package=candidate because we are just retrying the same package
+        if _try_install_command(["uv", "add", candidate], candidate, candidate, project_root, timeout):
+            print(f"  [python-version] Successfully installed '{candidate}' with Python {version}")
+            return True
+        
+        # Revert changes if failed
+        if original_pyproject:
+            _restore_pyproject(project_root, original_pyproject)
+            
+    # Restore original python version if we failed all attempts
+    if current_python:
+        print(f"  [python-version] Failed to find compatible Python version. Restoring {current_python}...")
+        subprocess.run(
+            ["uv", "python", "pin", current_python],
+            cwd=project_root,
+            check=False,
+            capture_output=True
+        )
+        
+    return False

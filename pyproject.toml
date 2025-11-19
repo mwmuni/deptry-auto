@@ -1,6 +1,6 @@
 [project]
 name = "deptry-auto"
-version = "0.3.2"
+version = "0.3.3"
 description = "Automatically add missing dependencies found by deptry using uv."
 readme = "README.md"
 authors = [
@@ -27,7 +27,10 @@ requires = [
 build-backend = "uv_build"
 
 [tool.uv]
-index-strategy = "unsafe-first-match"
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+url = "https://pypi.anaconda.org/conda-forge/simple"
 
 [[tool.uv.index]]
 url = "https://pypi.anaconda.org/"

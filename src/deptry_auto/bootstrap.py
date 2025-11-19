@@ -290,14 +290,13 @@ def setup_numpy_for_compilation() -> bool:
         try:
             result = subprocess.run(
                 [sys.executable, "-m", "pip", "install", "--upgrade", "numpy"],
-                capture_output=True,
                 timeout=300,
             )
             if result.returncode == 0:
                 print("[bootstrap] [OK] NumPy installed successfully")
                 return True
             else:
-                print(f"[bootstrap] [FAIL] Failed to install NumPy: {result.stderr.decode()}")
+                print("[bootstrap] [FAIL] Failed to install NumPy")
                 return False
         except Exception as e:
             print(f"[bootstrap] [FAIL] Error installing NumPy: {e}")
