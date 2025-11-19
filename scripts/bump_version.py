@@ -75,21 +75,20 @@ def bump_version() -> None:
     has_src_changes = _has_prefix(staged_files, "src/")
     pyproject_staged = "pyproject.toml" in staged_files
 
-    if not has_src_changes:
-        print("No src/ changes staged, skipping version bump")
-        return
-
-    if pyproject_staged:
-        print("pyproject.toml already staged; assuming version bump managed manually")
+    if not (has_src_changes or pyproject_staged):
+        print("No src/ or pyproject.toml changes staged, skipping version bump")
         return
 
     head_version = _read_version_from_git("HEAD:pyproject.toml")
     current_version = _read_version_from_path(PYPROJECT)
 
     if head_version and current_version != head_version:
-        print(
-            "Version already bumped in working tree; stage pyproject.toml to include it"
-        )
+        if pyproject_staged:
+            print("pyproject.toml staged with version change; assuming manual bump")
+        else:
+            print(
+                "Version already bumped in working tree; stage pyproject.toml to include it"
+            )
         return
 
     new_version = _increment_patch(current_version)
