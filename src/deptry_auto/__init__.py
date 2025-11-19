@@ -598,16 +598,23 @@ def _try_install_candidate(
     
     # Strategy 0: Try to install pre-built wheel first (no build)
     # This prioritizes Conda/wheels and avoids slow/failed builds if possible.
-    print(f"  [fast-path] Trying to install '{candidate}' using pre-built wheels...")
-    if _try_install_command(["uv", "add", "--no-build-package", candidate, candidate], candidate, original_package, project_root, timeout):
+    print(f"  [fast-path] Trying to install '{candidate}' using wheel-only resolution...")
+    if _try_install_command(["uv", "add", "--no-build", candidate], candidate, original_package, project_root, timeout):
         return True
     
-    print("  [fast-path] Pre-built wheel not found or not compatible. Falling back to build...")
+    print("  [fast-path] No wheel-only solution on current Python. Trying older Python versions before allowing builds...")
 
     # Strategy 1: Try downgrading Python version (prioritizing pre-built wheels)
     # If current python doesn't have a wheel, maybe an older one does.
     if _try_downgrading_python(candidate, project_root, timeout, no_build=True):
         return True
+
+    # Strategy 2: Allow dependencies to build but keep candidate wheel-only
+    print("  [fast-path] Allowing dependency builds while keeping candidate wheel-only...")
+    if _try_install_command(["uv", "add", "--no-build-package", candidate, candidate], candidate, original_package, project_root, timeout):
+        return True
+
+    print("  [fast-path] Wheels unavailable even after downgrade; falling back to builds on current Python...")
 
     # Try basic install (allowing build)
     if _try_install_command(["uv", "add", candidate], candidate, original_package, project_root, timeout):
