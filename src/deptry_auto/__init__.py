@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,6 +14,23 @@ from pathlib import Path
 from typing import Iterable, Iterator, List, Set, Tuple
 
 MISSING_DEP_CODE = "DEP001"
+_EXCLUDED_DIR_NAMES = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".nox",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    ".venv",
+    "__pycache__",
+    "build",
+    "dist",
+    "env",
+    "node_modules",
+    "site-packages",
+    "venv",
+}
 
 
 def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
@@ -141,8 +160,14 @@ def _filter_local_packages(
 ) -> Tuple[Set[str], Set[str]]:
     missing: Set[str] = set()
     local: Set[str] = set()
+    local_identifiers: Set[str] | None = None
     for package in packages:
         if _module_resides_in_project(package, project_root):
+            local.add(package)
+            continue
+        if local_identifiers is None:
+            local_identifiers = _collect_local_identifiers(project_root)
+        if _looks_like_local_identifier(package, local_identifiers):
             local.add(package)
         else:
             missing.add(package)
@@ -150,7 +175,7 @@ def _filter_local_packages(
 
 
 def _module_resides_in_project(package: str, project_root: Path) -> bool:
-    normalized = package.replace("-", "_")
+    normalized = _normalize_import_name(package)
     import_paths = _project_import_paths(project_root)
     with _temporary_sys_path(import_paths):
         try:
@@ -168,6 +193,62 @@ def _module_resides_in_project(package: str, project_root: Path) -> bool:
         origins.extend(Path(location) for location in spec.submodule_search_locations)
 
     return any(_is_within_project(origin, project_root) for origin in origins)
+
+
+def _normalize_import_name(name: str) -> str:
+    return name.replace("-", "_")
+
+
+def _normalized_key(name: str) -> str:
+    return _normalize_import_name(name).casefold()
+
+
+def _looks_like_local_identifier(package: str, identifiers: Set[str]) -> bool:
+    if not identifiers:
+        return False
+    return _normalized_key(package) in identifiers
+
+
+def _collect_local_identifiers(project_root: Path) -> Set[str]:
+    identifiers: Set[str] = set()
+    for path in _iter_python_files(project_root):
+        stem = path.stem
+        if stem != "__init__":
+            identifiers.add(_normalized_key(stem))
+        parent = path.parent
+        if (parent / "__init__.py").exists():
+            identifiers.add(_normalized_key(parent.name))
+        identifiers.update(_extract_class_names(path))
+    return identifiers
+
+
+def _iter_python_files(project_root: Path) -> Iterator[Path]:
+    for root, dirs, files in os.walk(project_root):
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in _EXCLUDED_DIR_NAMES and not d.startswith(".")
+        ]
+        for file_name in files:
+            if not file_name.endswith((".py", ".pyi")):
+                continue
+            yield Path(root) / file_name
+
+
+def _extract_class_names(path: Path) -> Set[str]:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    names: Set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            names.add(_normalized_key(node.name))
+    return names
 
 
 def _project_import_paths(project_root: Path) -> List[Path]:
