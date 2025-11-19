@@ -62,11 +62,10 @@ wheels = [
 
 [[package]]
 name = "deptry-auto"
-version = "0.2.15"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "deptry" },
-    { name = "scikit-image" },
 ]
 
 [package.dev-dependencies]
@@ -76,10 +75,7 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [
-    { name = "deptry", specifier = ">=0.24.0" },
-    { name = "scikit-image", specifier = ">=0.26.0rc0.dev0" },
-]
+requires-dist = [{ name = "deptry", specifier = ">=0.24.0" }]
 
 [package.metadata.requires-dev]
 dev = [

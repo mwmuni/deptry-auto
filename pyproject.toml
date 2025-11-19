@@ -9,7 +9,6 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "deptry>=0.24.0",
-    "scikit-image>=0.26.0rc0.dev0",
 ]
 
 [project.scripts]
