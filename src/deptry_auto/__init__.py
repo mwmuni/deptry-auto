@@ -9,11 +9,14 @@ import os
 import subprocess
 import sys
 import tempfile
+import xmlrpc.client
 from contextlib import contextmanager
+from functools import lru_cache
 from pathlib import Path
-from typing import Iterable, Iterator, List, Set, Tuple
+from typing import Dict, Iterable, Iterator, List, Set, Tuple
 
 MISSING_DEP_CODE = "DEP001"
+PYPI_RPC_URL = "https://pypi.org/pypi"
 _EXCLUDED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -30,6 +33,23 @@ _EXCLUDED_DIR_NAMES = {
     "node_modules",
     "site-packages",
     "venv",
+}
+_PACKAGE_NAME_OVERRIDES: Dict[str, str] = {
+    "pil": "Pillow",
+    "cv2": "opencv-python",
+    "serial": "pyserial",
+    "paho": "paho-mqtt",
+}
+_SKIPPED_PACKAGES = {
+    "machine",
+    "micropython",
+    "rp2",
+    "ucollections",
+    "ujson",
+    "uselect",
+    "ustruct",
+    "utime",
+    "neopixel",
 }
 
 
@@ -67,6 +87,7 @@ def main(argv: List[str] | None = None) -> None:
     report = _run_deptry_scan(project_root)
     missing_packages = _extract_missing_packages(report)
     missing_packages, local_packages = _filter_local_packages(missing_packages, project_root)
+    missing_packages, skipped_packages = _filter_skipped_packages(missing_packages)
 
     if local_packages:
         print(
@@ -74,19 +95,39 @@ def main(argv: List[str] | None = None) -> None:
             + ", ".join(sorted(local_packages))
         )
 
+    if skipped_packages:
+        print(
+            "Skipping packages that cannot be installed automatically: "
+            + ", ".join(sorted(skipped_packages))
+        )
+
     if not missing_packages:
         print("No missing dependencies found.")
         return
 
     print(f"Found missing dependencies: {', '.join(sorted(missing_packages))}")
+    failures: List[str] = []
     for package in sorted(missing_packages):
         if args.dry_run:
-            print(f"[dry-run] uv add {package}")
+            install_name = _candidate_install_names(package)[0]
+            if install_name != package:
+                print(
+                    f"[dry-run] uv add {install_name}  # resolved from '{package}'"
+                )
+            else:
+                print(f"[dry-run] uv add {package}")
             continue
-        _add_dependency(package, project_root)
+        if not _add_dependency(package, project_root):
+            failures.append(package)
 
     if args.dry_run:
         print("Dry run complete. No dependencies were modified.")
+    elif failures:
+        print(
+            "Failed to add the following packages: "
+            + ", ".join(failures)
+        )
+        sys.exit(1)
     else:
         print("Finished adding missing dependencies.")
 
@@ -146,13 +187,38 @@ def _extract_missing_packages(report: Iterable[dict]) -> Set[str]:
     return missing
 
 
-def _add_dependency(package: str, project_root: Path) -> None:
+def _add_dependency(package: str, project_root: Path) -> bool:
     print(f"Adding dependency '{package}' via uv...")
-    try:
-        subprocess.run(["uv", "add", package], cwd=project_root, check=True)
-    except subprocess.CalledProcessError as error:
-        print(f"Failed to add '{package}': {error}")
-        sys.exit(error.returncode)
+    candidates = _candidate_install_names(package)
+    attempted: List[str] = []
+    for candidate in candidates:
+        attempted.append(candidate)
+        result = subprocess.run(
+            ["uv", "add", candidate],
+            cwd=project_root,
+            text=True,
+            capture_output=True,
+        )
+        _relay_process_output(result)
+        if result.returncode == 0:
+            if candidate != package:
+                print(f"Installed '{package}' using PyPI project '{candidate}'.")
+            return True
+        if not _looks_like_missing_distribution(result):
+            print(f"uv add exited with {result.returncode} for '{candidate}'.")
+            return False
+        print(
+            f"Package '{candidate}' was not found on PyPI."
+            " Trying another candidate..."
+        )
+
+    print(
+        "Exhausted install candidates for '"
+        + package
+        + "': "
+        + ", ".join(attempted)
+    )
+    return False
 
 
 def _filter_local_packages(
@@ -172,6 +238,17 @@ def _filter_local_packages(
         else:
             missing.add(package)
     return missing, local
+
+
+def _filter_skipped_packages(packages: Iterable[str]) -> Tuple[Set[str], Set[str]]:
+    installable: Set[str] = set()
+    skipped: Set[str] = set()
+    for package in packages:
+        if _is_skipped_package(package):
+            skipped.add(package)
+        else:
+            installable.add(package)
+    return installable, skipped
 
 
 def _module_resides_in_project(package: str, project_root: Path) -> bool:
@@ -206,7 +283,8 @@ def _normalized_key(name: str) -> str:
 def _looks_like_local_identifier(package: str, identifiers: Set[str]) -> bool:
     if not identifiers:
         return False
-    return _normalized_key(package) in identifiers
+    package_key = _normalized_key(package)
+    return package_key in identifiers or package_key.replace("_", "") in identifiers
 
 
 def _collect_local_identifiers(project_root: Path) -> Set[str]:
@@ -214,12 +292,20 @@ def _collect_local_identifiers(project_root: Path) -> Set[str]:
     for path in _iter_python_files(project_root):
         stem = path.stem
         if stem != "__init__":
-            identifiers.add(_normalized_key(stem))
+            _add_identifier(identifiers, stem)
         parent = path.parent
-        if (parent / "__init__.py").exists():
-            identifiers.add(_normalized_key(parent.name))
-        identifiers.update(_extract_class_names(path))
+        if _looks_like_package_dir(parent):
+            _add_identifier(identifiers, parent.name)
+        for class_name in _extract_class_names(path):
+            _add_identifier(identifiers, class_name)
     return identifiers
+
+
+@lru_cache(maxsize=None)
+def _looks_like_package_dir(path: Path) -> bool:
+    if (path / "__init__.py").exists():
+        return True
+    return any(child.is_file() for child in path.glob("*.py"))
 
 
 def _iter_python_files(project_root: Path) -> Iterator[Path]:
@@ -247,8 +333,111 @@ def _extract_class_names(path: Path) -> Set[str]:
     names: Set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef):
-            names.add(_normalized_key(node.name))
+            names.add(_camel_to_snake(node.name))
     return names
+
+
+def _camel_to_snake(name: str) -> str:
+    result = []
+    for index, char in enumerate(name):
+        if char.isupper() and index and (not name[index - 1].isupper()):
+            result.append("_")
+        result.append(char.lower())
+    return "".join(result)
+
+
+def _is_skipped_package(package: str) -> bool:
+    return _normalized_key(package) in _SKIPPED_PACKAGES
+
+
+def _add_identifier(store: Set[str], value: str) -> None:
+    normalized = _normalized_key(value)
+    store.add(normalized)
+    store.add(normalized.replace("_", ""))
+
+
+def _candidate_install_names(package: str) -> List[str]:
+    names: List[str] = []
+    seen: Set[str] = set()
+
+    def add(candidate: str) -> None:
+        if not candidate:
+            return
+        key = candidate.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        names.append(candidate)
+
+    add(package)
+    override = _PACKAGE_NAME_OVERRIDES.get(_normalized_key(package))
+    if override:
+        add(override)
+    add(_normalize_import_name(package))
+    add(package.replace("_", "-"))
+    add(package.replace("-", "_"))
+    add(package.lower())
+
+    search_terms = {
+        package,
+        _normalize_import_name(package),
+        package.replace("_", " "),
+        _camel_to_snake(package),
+    }
+    for term in search_terms:
+        for hit in _search_pypi_candidates(term):
+            add(hit)
+
+    return names
+
+
+@lru_cache(maxsize=128)
+def _search_pypi_candidates(term: str) -> Tuple[str, ...]:
+    normalized = term.strip()
+    if not normalized:
+        return ()
+    try:
+        with xmlrpc.client.ServerProxy(PYPI_RPC_URL) as client:
+            hits = client.search({"name": normalized}, "or")
+    except OSError:
+        return ()
+    except xmlrpc.client.Error:
+        return ()
+
+    def ordering(item: dict) -> int:
+        return int(item.get("_pypi_ordering", 0))
+
+    sorted_hits = sorted(hits, key=ordering, reverse=True)
+    candidates: List[str] = []
+    for item in sorted_hits:
+        name = item.get("name")
+        if not name:
+            continue
+        if normalized.casefold() not in name.casefold():
+            continue
+        candidates.append(name)
+        if len(candidates) >= 5:
+            break
+    return tuple(candidates)
+
+
+def _looks_like_missing_distribution(result: subprocess.CompletedProcess[str]) -> bool:
+    message = (result.stdout or "") + "\n" + (result.stderr or "")
+    lowered = message.casefold()
+    keywords = [
+        "not found in the package registry",
+        "no matching distribution found",
+        "could not find a version",
+        "unsatisfiable",
+    ]
+    return any(keyword in lowered for keyword in keywords)
+
+
+def _relay_process_output(result: subprocess.CompletedProcess[str]) -> None:
+    if result.stdout:
+        print(result.stdout.rstrip())
+    if result.stderr:
+        print(result.stderr.rstrip(), file=sys.stderr)
 
 
 def _project_import_paths(project_root: Path) -> List[Path]:

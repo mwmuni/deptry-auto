@@ -34,6 +34,12 @@ What happens:
    project tree are ignored.
 3. Each remaining missing package is added to the target project with `uv add <package>`.
 
+### Special cases
+
+- The installer automatically queries the PyPI XML-RPC API for likely package matches when an import name is missing (so `PIL` resolves to `Pillow`, `cv2` to `opencv-python`, and similar cases work without manual overrides).
+- Imports that only exist on MicroPython builds (`machine`, `micropython`, `rp2`, `ucollections`, `ujson`, `uselect`, `ustruct`, `utime`, `neopixel`) are skipped automatically.
+- If one installation fails, `deptry-auto` now continues with the remaining packages, tries fallback names where applicable, and reports any failures at the end.
+
 `deptry` exits with code `1` when it finds issues, so `deptry-auto` tolerates both `0` (clean) and `1` (issues) but still halts for any other failure. Use `--dry-run` when you only need a report of the missing dependencies.
 
 ## Development
