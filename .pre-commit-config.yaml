@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: bump-version
+        name: Bump version
+        entry: uv run python scripts/bump_version.py
+        language: system
+        pass_filenames: false
+        stages: [pre-commit]

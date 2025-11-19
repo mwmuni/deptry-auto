@@ -39,7 +39,8 @@ What happens:
 ## Development
 
 ```bash
-uv sync            # install dependencies
+uv sync --group dev            # install dependencies
+uv run pre-commit install      # install pre-commit hooks
 uv run deptry-auto --dry-run .
 ```
 
