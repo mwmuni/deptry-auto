@@ -472,6 +472,16 @@ def main(argv: List[str] | None = None) -> None:
         print("\n[platforms] Platform constraints detected during installation:")
         _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
 
+    print("\n[sync] Running 'uv sync' to update the environment...")
+    sync_result = subprocess.run(
+        ["uv", "sync"],
+        cwd=project_root,
+        text=True,
+        env=os.environ,
+    )
+    if sync_result.returncode != 0:
+        print("[sync] Warning: 'uv sync' failed. Please run it manually to ensure the environment is up to date.")
+
 
 def _run_deptry_scan(project_root: Path) -> List[dict]:
     temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
