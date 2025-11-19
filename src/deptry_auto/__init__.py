@@ -1,3 +1,4 @@
+# Main module for deptry-auto
 from __future__ import annotations
 
 import argparse

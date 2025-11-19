@@ -1,10 +1,10 @@
 [project]
 name = "deptry-auto"
-version = "0.2.3"
+version = "0.2.4"
 description = "Automatically add missing dependencies found by deptry using uv."
 readme = "README.md"
 authors = [
-    { name = "Matthew Muller", email = "matthew.muller@epiroc.com" },
+    { name = "Matthew Muller", email = "matthew.muller@uon.edu.au" },
 ]
 requires-python = ">=3.14"
 dependencies = [
@@ -17,7 +17,7 @@ deptry-auto = "deptry_auto:main"
 [dependency-groups]
 dev = [
     "pre-commit",
-    "tomli-w",
+    "tomli",
 ]
 
 [build-system]

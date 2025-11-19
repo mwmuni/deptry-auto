@@ -44,4 +44,7 @@ uv run pre-commit install      # install pre-commit hooks
 uv run deptry-auto --dry-run .
 ```
 
+The local pre-commit hook automatically bumps the patch version whenever a file under `src/` is staged. The first
+commit attempt will therefore fail after the hook updates `pyproject.toml`; stage the modified file and re-run `git commit`.
+
 Run the CLI against a throwaway project if you want to observe `uv add` in action.

@@ -3,7 +3,10 @@ repos:
     hooks:
       - id: bump-version
         name: Bump version
-        entry: uv run python scripts/bump_version.py
-        language: system
+        entry: python scripts/bump_version.py
+        language: python
+        language_version: python3
+        additional_dependencies:
+          - tomli
         pass_filenames: false
         stages: [pre-commit]
