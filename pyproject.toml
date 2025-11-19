@@ -1,6 +1,6 @@
 [project]
 name = "deptry-auto"
-version = "0.3.1"
+version = "0.3.2"
 description = "Automatically add missing dependencies found by deptry using uv."
 readme = "README.md"
 authors = [
@@ -26,11 +26,17 @@ requires = [
 ]
 build-backend = "uv_build"
 
+[tool.uv]
+index-strategy = "unsafe-first-match"
+
 [[tool.uv.index]]
 url = "https://pypi.anaconda.org/"
 
 [[tool.uv.index]]
 url = "https://pypi.anaconda.org/scientific-python-nightly-wheels/simple"
+
+[[tool.uv.index]]
+url = "https://pypi.org/simple"
 
 [tool.uv.workspace]
 members = [
