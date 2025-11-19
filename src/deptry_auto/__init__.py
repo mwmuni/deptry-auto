@@ -208,7 +208,7 @@ def _extract_missing_packages(report: Iterable[dict]) -> Set[str]:
 def _add_dependencies_batch(
     package_to_install: Dict[str, str], project_root: Path, timeout: int | None
 ) -> List[str]:
-    """Install all packages with fallback to individual installs on failure."""
+    """Install all packages with smart fallback to individual installs on failure."""
     install_names = list(package_to_install.values())
     print(f"Adding dependencies via uv: {', '.join(install_names)}")
     
@@ -229,7 +229,31 @@ def _add_dependencies_batch(
     if result.returncode == 0:
         return []
     
-    # Batch failed; try individual packages to identify which ones actually fail
+    # Batch failed; try to identify which packages are problematic
+    # and retry with only the viable ones
+    problematic_packages = _identify_problematic_packages_in_batch(
+        result, package_to_install
+    )
+    
+    if problematic_packages:
+        # Retry batch with remaining packages
+        viable_packages = {
+            pkg: name for pkg, name in package_to_install.items()
+            if pkg not in problematic_packages
+        }
+        
+        if viable_packages:
+            print(
+                f"Skipping packages with unresolvable dependencies: "
+                f"{', '.join(problematic_packages)}"
+            )
+            print("Retrying batch installation with remaining packages...")
+            failures = _add_dependencies_batch(viable_packages, project_root, timeout)
+            # Add the skipped packages to the failures list
+            failures.extend(problematic_packages)
+            return failures
+    
+    # Couldn't identify specific problematic packages, try individually
     print("Batch installation failed. Attempting individual package installations...")
     return _add_dependencies_individually(package_to_install, project_root, timeout)
 
@@ -243,6 +267,29 @@ def _add_dependencies_individually(
         if not _try_install_with_candidates(package, install_name, project_root, timeout):
             failures.append(package)
     return failures
+
+
+def _identify_problematic_packages_in_batch(
+    result: subprocess.CompletedProcess[str], package_to_install: Dict[str, str]
+) -> Set[str]:
+    """Try to identify which packages in a batch caused the failure."""
+    message = (result.stdout or "") + "\n" + (result.stderr or "")
+    lowered = message.casefold()
+    
+    # Look for package names mentioned in error messages
+    problematic: Set[str] = set()
+    
+    for package, install_name in package_to_install.items():
+        # Check if this specific package name appears in an error
+        if (install_name.casefold() in lowered or 
+            package.casefold() in lowered or
+            install_name.lower().replace("_", "-") in lowered or
+            package.lower().replace("_", "-") in lowered):
+            # Look for "not found" or "unsatisfiable" keywords near the package name
+            if "not found" in lowered or "unsatisfiable" in lowered:
+                problematic.add(package)
+    
+    return problematic
 
 
 def _try_install_with_candidates(
