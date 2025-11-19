@@ -74,7 +74,17 @@ class PythonVersionPinned(RuntimeError):
         self.version = version
 
 
+class PackageBlacklisted(RuntimeError):
+    """Raised when a package is permanently blacklisted for this run."""
+
+    def __init__(self, package: str, reason: str):
+        super().__init__(f"Package '{package}' blacklisted: {reason}")
+        self.package = package
+        self.reason = reason
+
+
 _PINNED_PYTHON_VERSION: str | None = None
+_BLACKLISTED_PACKAGES: Dict[str, str] = {}
 
 _REQUIRES_PYTHON_REGEX = re.compile(r'^(\s*requires-python\s*=\s*")(.*?)(")\s*$', re.MULTILINE)
 
@@ -382,9 +392,24 @@ def main(argv: List[str] | None = None) -> None:
                 + ", ".join(sorted(skipped_packages))
             )
 
+        blacklisted_present = sorted(
+            pkg for pkg in missing_packages if _is_blacklisted(pkg)
+        )
+        if blacklisted_present:
+            print(
+                "Skipping previously blacklisted packages: "
+                + ", ".join(blacklisted_present)
+            )
+            missing_packages = {
+                pkg for pkg in missing_packages if not _is_blacklisted(pkg)
+            }
+
         if not missing_packages:
-            print("No missing dependencies found.")
-            return
+            if _BLACKLISTED_PACKAGES:
+                print("All remaining missing packages are blacklisted; nothing to install.")
+            else:
+                print("No missing dependencies found.")
+            break
 
         print(f"Found missing dependencies: {', '.join(sorted(missing_packages))}")
 
@@ -415,6 +440,11 @@ def main(argv: List[str] | None = None) -> None:
                 f"[python-version] Restarting installation under Python {exc.version} after pinning...\n"
             )
             continue
+        except PackageBlacklisted as exc:
+            print(
+                f"[blacklist] {exc.package} is not installable ({exc.reason}); restarting batch without it...\n"
+            )
+            continue
 
     if failures:
         print(
@@ -425,9 +455,19 @@ def main(argv: List[str] | None = None) -> None:
         if _PLATFORM_CONSTRAINTS:
             print("\n[platforms] Platform constraints detected during installation:")
             _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
+        if _BLACKLISTED_PACKAGES:
+            print(
+                "\n[blacklist] The following packages were skipped as unresolvable: "
+                + ", ".join(sorted(_BLACKLISTED_PACKAGES.values()))
+            )
         sys.exit(1)
 
     print("Finished adding missing dependencies.")
+    if _BLACKLISTED_PACKAGES:
+        print(
+            "\n[blacklist] The following packages were skipped as unresolvable: "
+            + ", ".join(sorted(_BLACKLISTED_PACKAGES.values()))
+        )
     if _PLATFORM_CONSTRAINTS:
         print("\n[platforms] Platform constraints detected during installation:")
         _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
@@ -587,6 +627,10 @@ def _try_install_with_candidates(
     package: str, preferred_name: str, project_root: Path, timeout: int | None
 ) -> bool:
     """Try to install a package with candidate resolution."""
+    if _is_blacklisted(package):
+        print(f"  [blacklist] '{package}' previously marked unresolvable; skipping.")
+        return True
+
     candidates = _candidate_install_names(package)
     # Prefer the already-resolved name first
     if preferred_name in candidates:
@@ -724,12 +768,15 @@ def _try_install_candidate(
     if not _looks_like_missing_distribution(result):
         print(f"uv add exited with {result.returncode} for '{candidate}'.")
         return False
-    
-    print(
-        f"Package '{candidate}' was not found on PyPI."
-        " Trying another candidate..."
+
+    _blacklist_package(
+        original_package,
+        "package not found or no compatible distributions on configured indexes",
     )
-    return False
+    raise PackageBlacklisted(
+        original_package,
+        "package not found or no compatible distributions",
+    )
 
 
 def _try_install_command(
@@ -1148,6 +1195,18 @@ def _get_current_python_version(project_root: Path) -> str | None:
         return None
 
 
+def _is_blacklisted(package: str) -> bool:
+    return _normalized_key(package) in _BLACKLISTED_PACKAGES
+
+
+def _blacklist_package(package: str, reason: str) -> None:
+    key = _normalized_key(package)
+    if key in _BLACKLISTED_PACKAGES:
+        return
+    _BLACKLISTED_PACKAGES[key] = package
+    print(f"  [blacklist] Skipping '{package}' for the rest of this run: {reason}")
+
+
 def _set_python_pin(project_root: Path, version: str | None) -> bool:
     """Pin (or unpin) the project's Python version via uv."""
     cmd = ["uv", "python", "pin"]
@@ -1216,21 +1275,24 @@ def _try_downgrading_python(
     preferred_versions: List[str] = []
     if _PINNED_PYTHON_VERSION:
         preferred_versions.append(_PINNED_PYTHON_VERSION)
-    for version in ["3.12", "3.11", "3.10"]:
+    for version in ["3.13", "3.12"]:
         if version not in preferred_versions:
             preferred_versions.append(version)
 
     for version in preferred_versions:
         pin_changed = False
-        if current_python and current_python.startswith(version):
-            pass
-        else:
+        already_on_version = bool(current_python and current_python.startswith(version))
+
+        original_pyproject = _update_requires_python(project_root, version)
+
+        if not already_on_version:
             print(f"  [python-version] Pinning Python {version} and retrying install...")
             if not _set_python_pin(project_root, version):
+                if original_pyproject:
+                    _restore_pyproject(project_root, original_pyproject)
                 continue
             pin_changed = True
 
-        original_pyproject = _update_requires_python(project_root, version)
         success = False
 
         try:
@@ -1259,7 +1321,6 @@ def _try_downgrading_python(
                 if original_pyproject:
                     _restore_pyproject(project_root, original_pyproject)
                 if pin_changed:
-                    # Revert pin on failure
                     if current_python:
                         _set_python_pin(project_root, current_python)
                     else:
