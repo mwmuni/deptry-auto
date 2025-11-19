@@ -6,9 +6,11 @@ import ast
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import xmlrpc.client
 from contextlib import contextmanager
 from functools import lru_cache
@@ -18,6 +20,7 @@ from difflib import SequenceMatcher
 
 MISSING_DEP_CODE = "DEP001"
 PYPI_RPC_URL = "https://pypi.org/pypi"
+_PLATFORM_CONSTRAINTS: Set[str] = set()  # Global to collect platform constraints
 _EXCLUDED_DIR_NAMES = {
     ".git",
     ".hg",
@@ -79,6 +82,81 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         ),
     )
     return parser.parse_args(argv)
+
+
+def _detect_current_platform() -> str | None:
+    """Detect the current platform in uv constraint format."""
+    system = sys.platform
+    
+    if system == "win32":
+        # Windows: win32
+        return "sys_platform == 'win32'"
+    elif system == "darwin":
+        # macOS: darwin
+        return "sys_platform == 'darwin'"
+    elif system == "linux":
+        # Linux: linux
+        return "sys_platform == 'linux'"
+    else:
+        return None
+
+
+def _extract_platform_requirements_from_error(error_message: str) -> Set[str]:
+    """Extract platform requirements mentioned in uv error messages."""
+    requirements: Set[str] = set()
+    
+    # Look for patterns like: sys_platform == 'win32' and platform_machine == 'AMD64'
+    pattern = r"['\"]?sys_platform == '[^']+\'(?:\s+and\s+platform_machine == '[^']+\')?['\"]?"
+    matches = re.findall(pattern, error_message)
+    for match in matches:
+        requirements.add(match.strip('"\''))
+    
+    return requirements
+
+
+def _update_pyproject_with_constraints(project_root: Path, constraints: Set[str]) -> bool:
+    """Update pyproject.toml with required-environments constraints."""
+    if not constraints:
+        return False
+    
+    pyproject_path = project_root / "pyproject.toml"
+    if not pyproject_path.exists():
+        print(f"[platforms] pyproject.toml not found at {project_root}")
+        return False
+    
+    try:
+        with open(pyproject_path, "rb") as f:
+            content = tomllib.load(f)
+    except Exception as e:
+        print(f"[platforms] Could not read pyproject.toml: {e}")
+        return False
+    
+    # Initialize uv tool config if not present
+    if "tool" not in content:
+        content["tool"] = {}
+    if "uv" not in content["tool"]:
+        content["tool"]["uv"] = {}
+    
+    # Get existing required-environments or create empty list
+    existing = content["tool"]["uv"].get("required-environments", [])
+    if isinstance(existing, str):
+        existing = [existing]
+    elif not isinstance(existing, list):
+        existing = []
+    
+    # Add new constraints that aren't already present
+    for constraint in constraints:
+        if constraint not in existing:
+            existing.append(constraint)
+    
+    content["tool"]["uv"]["required-environments"] = existing
+    
+    # Fallback: print what should be added (automatic write requires tomli_w which may not be available)
+    print("[platforms] Recommended platform constraints to add to your pyproject.toml:")
+    print("[platforms] Under [tool.uv] section, add:")
+    for constraint in constraints:
+        print(f'[platforms]   required-environments = ["{constraint}"]')
+    return True
 
 
 def main(argv: List[str] | None = None) -> None:
@@ -145,9 +223,17 @@ def main(argv: List[str] | None = None) -> None:
                 "Failed to add the following packages: "
                 + ", ".join(failures)
             )
+            # Report any platform constraints that were discovered
+            if _PLATFORM_CONSTRAINTS:
+                print("\n[platforms] Platform constraints detected during installation:")
+                _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
             sys.exit(1)
         else:
             print("Finished adding missing dependencies.")
+            # Report any platform constraints that were discovered
+            if _PLATFORM_CONSTRAINTS:
+                print("\n[platforms] Platform constraints detected during installation:")
+                _update_pyproject_with_constraints(project_root, _PLATFORM_CONSTRAINTS)
 
 
 def _run_deptry_scan(project_root: Path) -> List[dict]:
@@ -362,7 +448,13 @@ def _try_install_candidate(
     
     # Check if it's a platform/wheel compatibility issue
     if _looks_like_platform_error(result):
-        print(f"Platform compatibility issue with '{candidate}'. Trying without pre-built wheels...")
+        print(f"Platform compatibility issue with '{candidate}'.")
+        # Extract and collect platform constraints from error message
+        platform_reqs = _extract_platform_requirements_from_error(result.stdout or "" + "\n" + result.stderr or "")
+        if platform_reqs:
+            _PLATFORM_CONSTRAINTS.update(platform_reqs)
+            print(f"[platforms] Extracted constraint: {', '.join(platform_reqs)}")
+        print("Trying without pre-built wheels...")
         # Try with --no-build to allow building from source
         if _try_install_command(["uv", "add", "--no-build", candidate], candidate, original_package, project_root, timeout):
             return True
