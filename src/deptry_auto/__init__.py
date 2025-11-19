@@ -1183,15 +1183,25 @@ def _try_downgrading_python(candidate: str, project_root: Path, timeout: int | N
         original_pyproject = _update_requires_python(project_root, version)
         
         # 3. Try install
-        # We use the basic install command here. If it works, uv will handle the rest.
-        # We pass original_package=candidate because we are just retrying the same package
-        cmd = ["uv", "add", candidate]
         if no_build:
-            cmd = ["uv", "add", "--no-build-package", candidate, candidate]
-            
-        if _try_install_command(cmd, candidate, candidate, project_root, timeout):
-            print(f"  [python-version] Successfully installed '{candidate}' with Python {version}")
-            return True
+            # Attempt 1: Strict no-build (forces wheels for everything, including deps)
+            # This helps resolve to older versions that have wheels (e.g. scikit-image)
+            print(f"  [python-version] Trying strict wheel-only install for '{candidate}'...")
+            if _try_install_command(["uv", "add", "--no-build", candidate], candidate, candidate, project_root, timeout):
+                print(f"  [python-version] Successfully installed '{candidate}' (wheels only) with Python {version}")
+                return True
+
+            # Attempt 2: Relaxed no-build (only candidate must be wheel)
+            # If strict failed (maybe some other dep needs build), try allowing deps to build
+            print("  [python-version] Strict wheel install failed. Retrying with --no-build-package...")
+            if _try_install_command(["uv", "add", "--no-build-package", candidate, candidate], candidate, candidate, project_root, timeout):
+                print(f"  [python-version] Successfully installed '{candidate}' with Python {version}")
+                return True
+        else:
+            # Standard install (allowing build)
+            if _try_install_command(["uv", "add", candidate], candidate, candidate, project_root, timeout):
+                print(f"  [python-version] Successfully installed '{candidate}' with Python {version}")
+                return True
         
         # Revert changes if failed
         if original_pyproject:
