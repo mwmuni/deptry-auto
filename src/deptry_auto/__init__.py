@@ -599,10 +599,15 @@ def _try_install_candidate(
     # Strategy 0: Try to install pre-built wheel first (no build)
     # This prioritizes Conda/wheels and avoids slow/failed builds if possible.
     print(f"  [fast-path] Trying to install '{candidate}' using pre-built wheels...")
-    if _try_install_command(["uv", "add", "--no-build", candidate], candidate, original_package, project_root, timeout):
+    if _try_install_command(["uv", "add", "--no-build-package", candidate, candidate], candidate, original_package, project_root, timeout):
         return True
     
     print("  [fast-path] Pre-built wheel not found or not compatible. Falling back to build...")
+
+    # Strategy 1: Try downgrading Python version (prioritizing pre-built wheels)
+    # If current python doesn't have a wheel, maybe an older one does.
+    if _try_downgrading_python(candidate, project_root, timeout, no_build=True):
+        return True
 
     # Try basic install (allowing build)
     if _try_install_command(["uv", "add", candidate], candidate, original_package, project_root, timeout):
@@ -663,6 +668,11 @@ def _try_install_candidate(
             pass 
 
         if _try_install_command(["uv", "add", "--no-build-isolation", candidate], candidate, original_package, project_root, timeout):
+            return True
+
+        # Strategy 4: Try downgrading Python version (allowing build)
+        # If build fails on current python, maybe it works on older python
+        if _try_downgrading_python(candidate, project_root, timeout, no_build=False):
             return True
 
         print("This package may not have pre-built wheels for your platform and source build failed.")
@@ -1146,7 +1156,7 @@ def _restore_pyproject(project_root: Path, content: str) -> None:
     (project_root / "pyproject.toml").write_text(content, encoding="utf-8")
 
 
-def _try_downgrading_python(candidate: str, project_root: Path, timeout: int | None) -> bool:
+def _try_downgrading_python(candidate: str, project_root: Path, timeout: int | None, no_build: bool = False) -> bool:
     print(f"  [python-version] Checking if '{candidate}' works with older Python versions...")
     
     current_python = _get_current_python_version(project_root)
@@ -1175,7 +1185,11 @@ def _try_downgrading_python(candidate: str, project_root: Path, timeout: int | N
         # 3. Try install
         # We use the basic install command here. If it works, uv will handle the rest.
         # We pass original_package=candidate because we are just retrying the same package
-        if _try_install_command(["uv", "add", candidate], candidate, candidate, project_root, timeout):
+        cmd = ["uv", "add", candidate]
+        if no_build:
+            cmd = ["uv", "add", "--no-build-package", candidate, candidate]
+            
+        if _try_install_command(cmd, candidate, candidate, project_root, timeout):
             print(f"  [python-version] Successfully installed '{candidate}' with Python {version}")
             return True
         
