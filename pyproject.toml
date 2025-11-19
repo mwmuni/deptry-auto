@@ -9,6 +9,7 @@ authors = [
 requires-python = ">=3.14"
 dependencies = [
     "deptry>=0.24.0",
+    "scikit-image>=0.26.0rc0.dev0",
 ]
 
 [project.scripts]
@@ -25,3 +26,14 @@ requires = [
     "uv_build>=0.9.9,<0.10.0",
 ]
 build-backend = "uv_build"
+
+[[tool.uv.index]]
+url = "https://pypi.anaconda.org/"
+
+[[tool.uv.index]]
+url = "https://pypi.anaconda.org/scientific-python-nightly-wheels/simple"
+
+[tool.uv.workspace]
+members = [
+    "tests",
+]

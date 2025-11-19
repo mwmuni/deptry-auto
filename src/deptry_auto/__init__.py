@@ -12,14 +12,23 @@ import sys
 import tempfile
 import tomllib
 import xmlrpc.client
+import urllib.request
+import ssl
 from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Set, Tuple
 from difflib import SequenceMatcher
 
+try:
+    from .bootstrap import bootstrap_build_environment, activate_msvc_environment
+except ImportError:
+    bootstrap_build_environment = None  # type: ignore
+    activate_msvc_environment = None  # type: ignore
+
 MISSING_DEP_CODE = "DEP001"
 PYPI_RPC_URL = "https://pypi.org/pypi"
+MAPPING_URL = "https://raw.githubusercontent.com/bndr/pipreqs/master/pipreqs/mapping"
 _PLATFORM_CONSTRAINTS: Set[str] = set()  # Global to collect platform constraints
 _EXCLUDED_DIR_NAMES = {
     ".git",
@@ -43,6 +52,7 @@ _PACKAGE_NAME_OVERRIDES: Dict[str, str] = {
     "cv2": "opencv-python",
     "serial": "pyserial",
     "paho": "paho-mqtt",
+    "skimage": "scikit-image",
 }
 _SKIPPED_PACKAGES = {
     "machine",
@@ -81,7 +91,143 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
             "on (use 0 to disable)."
         ),
     )
+    parser.add_argument(
+        "--auto-bootstrap",
+        action="store_true",
+        help="Automatically set up build environment with pip tools before resolving dependencies.",
+    )
+    parser.add_argument(
+        "--build-pref",
+        type=str,
+        default=None,
+        choices=["msvc", "ninja", "cmake", "meson"],
+        help="Preferred build system (defaults to auto-detect local tools, then try alternatives).",
+    )
     return parser.parse_args(argv)
+
+
+def _check_build_tool_available(tool: str) -> bool:
+    """Check if a specific build tool is available on the system."""
+    tool_commands: Dict[str, List[str]] = {
+        "msvc": ["cl.exe", "/?"],
+        "cmake": ["cmake", "--version"],
+        "ninja": ["ninja", "--version"],
+        "meson": [sys.executable, "-m", "meson", "--version"],
+    }
+    
+    if tool not in tool_commands:
+        return False
+    
+    try:
+        result = subprocess.run(
+            tool_commands[tool],
+            capture_output=True,
+            timeout=5,
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
+        return False
+
+
+def _find_available_build_tools() -> List[str]:
+    """Find all available build tools on the system."""
+    available = []
+    for tool in ["msvc", "cmake", "ninja", "meson"]:
+        if _check_build_tool_available(tool):
+            available.append(tool)
+    return available
+
+
+def _resolve_build_system(preferred: str | None = None) -> str | None:
+    """
+    Resolve which build system to use.
+    
+    Strategy:
+    1. If preferred is MSVC, attempt to activate it (even if not in PATH)
+    2. If preferred is specified and available, use it
+    3. Otherwise, find first available local tool
+    4. If no local tools, return None (caller can install via bootstrap)
+    
+    Args:
+        preferred: Preferred build system ('msvc', 'ninja', 'cmake', 'meson')
+    
+    Returns:
+        The resolved build system name, or None if none available
+    """
+    # Special handling for MSVC: attempt activation even if not in PATH
+    if preferred == "msvc":
+        print("[build-sys] Attempting to activate MSVC environment...")
+        if activate_msvc_environment is not None:
+            try:
+                if activate_msvc_environment():
+                    print("[build-sys] [OK] MSVC environment activated and ready for use")
+                    return "msvc"
+                else:
+                    print("[build-sys] [WARN] Could not activate MSVC, trying alternatives...")
+            except Exception as e:
+                print(f"[build-sys] [WARN] Error activating MSVC: {e}")
+    
+    available = _find_available_build_tools()
+    
+    if not available:
+        return None
+    
+    selected = None
+    if preferred and preferred in available:
+        print(f"[build-sys] Using preferred build system: {preferred}")
+        selected = preferred
+    elif preferred and preferred not in available:
+        print(f"[build-sys] Preferred {preferred} not available, using: {available[0]}")
+        selected = available[0]
+    else:
+        selected = available[0]
+    
+    return selected
+
+
+def _check_build_requirements() -> Dict[str, bool]:
+    """Check if build tools are available on the system."""
+    requirements: Dict[str, bool] = {}
+    
+    for tool in ["msvc", "cmake", "ninja", "meson"]:
+        requirements[tool] = _check_build_tool_available(tool)
+    
+    # Check for NumPy (needed for many packages)
+    try:
+        __import__("numpy")
+        requirements["numpy"] = True
+    except ImportError:
+        requirements["numpy"] = False
+    
+    return requirements
+
+
+def _report_build_requirements(project_root: Path) -> None:
+    """Check and report on build requirements for source builds."""
+    print("\n[build-env] Checking build environment for source compilation...")
+    requirements = _check_build_requirements()
+    
+    missing = [k for k, v in requirements.items() if not v]
+    
+    if not missing:
+        print("[build-env] [OK] All build tools are available")
+        return
+    
+    print(f"[build-env] [FAIL] Missing build tools: {', '.join(missing)}")
+    print("\n[build-env] To build packages from source on Windows, you need:")
+    print("[build-env] 1. Microsoft Visual C++ Compiler (MSVC)")
+    print("[build-env]    - Download: https://visualstudio.microsoft.com/downloads/")
+    print("[build-env]    - Select 'Desktop development with C++'")
+    print("[build-env] 2. CMake")
+    print("[build-env]    - Install via: pip install cmake")
+    print("[build-env] 3. Ninja build system")
+    print("[build-env]    - Install via: pip install ninja")
+    print("[build-env] 4. Meson build system")
+    print("[build-env]    - Install via: pip install meson")
+    print("\n[build-env] Alternatively, use pre-built wheels by:")
+    print("[build-env] - Using an older Python version (3.12 or 3.13)")
+    print("[build-env] - Waiting for wheels to be built for Python 3.14")
+    print("[build-env] - Using conda which has pre-built packages")
 
 
 def _detect_current_platform() -> str | None:
@@ -161,6 +307,37 @@ def _update_pyproject_with_constraints(project_root: Path, constraints: Set[str]
 
 def main(argv: List[str] | None = None) -> None:
     args = parse_args(argv)
+    
+    # Resolve build system preference
+    resolved_build_sys = _resolve_build_system(args.build_pref)
+    if resolved_build_sys:
+        print(f"[deptry-auto] Resolved build system: {resolved_build_sys}")
+    
+    # Handle auto-bootstrap: detect environment issues and set up if needed
+    if args.auto_bootstrap:
+        print("[deptry-auto] Auto-detecting build environment...")
+        build_status = _check_build_requirements()
+        missing_tools = [k for k, v in build_status.items() if not v]
+        
+        if missing_tools:
+            print(f"[deptry-auto] Missing build tools: {', '.join(missing_tools)}")
+            print("[deptry-auto] Attempting automatic setup...")
+            
+            if bootstrap_build_environment is None:
+                print("[deptry-auto] Warning: bootstrap module not available")
+            else:
+                try:
+                    # Pass preferred build system (exclude 'msvc' since bootstrap handles it separately)
+                    preferred_for_bootstrap = args.build_pref if args.build_pref != "msvc" else None
+                    bootstrap_build_environment(auto_install=True, preferred=preferred_for_bootstrap)
+                    print("[deptry-auto] Build environment setup complete")
+                    # Re-resolve after bootstrap
+                    resolved_build_sys = _resolve_build_system(args.build_pref)
+                except Exception as e:
+                    print(f"[deptry-auto] Warning: Build environment setup had issues: {e}")
+        else:
+            print("[deptry-auto] Build environment ready")
+    
     project_root = Path(args.project_root).resolve()
 
     if not project_root.exists():
@@ -223,6 +400,8 @@ def main(argv: List[str] | None = None) -> None:
                 "Failed to add the following packages: "
                 + ", ".join(failures)
             )
+            # Check if build environment is needed
+            _report_build_requirements(project_root)
             # Report any platform constraints that were discovered
             if _PLATFORM_CONSTRAINTS:
                 print("\n[platforms] Platform constraints detected during installation:")
@@ -305,6 +484,7 @@ def _add_dependencies_batch(
             cwd=project_root,
             text=True,
             timeout=timeout,
+            env=os.environ,
         )
     except subprocess.TimeoutExpired:
         print(
@@ -314,10 +494,10 @@ def _add_dependencies_batch(
         return _add_dependencies_individually(package_to_install, project_root, timeout)
     
     if result.returncode == 0:
-        print(f"[batch] ✓ All {len(install_names)} packages installed successfully")
+        print(f"[batch] [OK] All {len(install_names)} packages installed successfully")
         return []
     
-    print(f"[batch] ✗ Batch install failed (exit code {result.returncode})")
+    print(f"[batch] [FAIL] Batch install failed (exit code {result.returncode})")
     # and retry with only the viable ones
     problematic_packages = _identify_problematic_packages_in_batch(
         result, package_to_install
@@ -355,10 +535,10 @@ def _add_dependencies_individually(
     for idx, (package, install_name) in enumerate(package_to_install.items(), 1):
         print(f"\n[individual] [{idx}/{total}] Installing '{package}' as '{install_name}'...")
         if not _try_install_with_candidates(package, install_name, project_root, timeout):
-            print(f"[individual] [{idx}/{total}] ✗ Failed to install '{package}'")
+            print(f"[individual] [{idx}/{total}] [FAIL] Failed to install '{package}'")
             failures.append(package)
         else:
-            print(f"[individual] [{idx}/{total}] ✓ Successfully installed '{package}'")
+            print(f"[individual] [{idx}/{total}] [OK] Successfully installed '{package}'")
     return failures
 
 
@@ -425,6 +605,7 @@ def _try_install_candidate(
             text=True,
             capture_output=True,
             timeout=timeout,
+            env=os.environ,
         )
     except subprocess.TimeoutExpired:
         print(
@@ -442,7 +623,42 @@ def _try_install_candidate(
     # Check if it's a build failure - skip this candidate and try next
     if _looks_like_build_failure(result):
         print(f"Build failure with '{candidate}' (compilation errors).")
-        print("This package may not have pre-built wheels for your platform.")
+        
+        # Strategy 1: Try scientific-python nightly wheels (PREFERRED)
+        # Many scientific packages publish nightly wheels that support newer Python versions
+        print("  [robust-build] Trying scientific-python nightly wheels...")
+        nightly_index = "https://pypi.anaconda.org/scientific-python-nightly-wheels/simple"
+        # We use --index to ensure the source is persisted in pyproject.toml
+        if _try_install_command(["uv", "add", "--index", nightly_index, candidate], candidate, original_package, project_root, timeout):
+            return True
+
+        # Strategy 2: Try pre-releases (often have fixes for newer Python versions)
+        print(f"  [robust-build] Nightly wheels failed. Trying standard pre-release version for '{candidate}'...")
+        if _try_install_command(["uv", "add", "--prerelease=allow", candidate], candidate, original_package, project_root, timeout):
+            return True
+
+        # Strategy 3: Try no-build-isolation with updated build tools
+        # This helps when the package's build-system requirements are too old for the current Python
+        print("  [robust-build] Pre-release failed. Attempting build with local environment (no-build-isolation)...")
+        
+        # Install common build deps into current env to support the build
+        print("  [robust-build] Installing modern build dependencies (Cython, NumPy, etc.)...")
+        try:
+            # We use 'uv pip install' to install into the current environment
+            subprocess.run(
+                ["uv", "pip", "install", "Cython>=3.0.0", "numpy>=2.0.0", "setuptools>=65.0.0", "wheel", "meson-python", "ninja"],
+                cwd=project_root,
+                check=False,
+                capture_output=True,
+                env=os.environ
+            )
+        except Exception:
+            pass 
+
+        if _try_install_command(["uv", "add", "--no-build-isolation", candidate], candidate, original_package, project_root, timeout):
+            return True
+
+        print("This package may not have pre-built wheels for your platform and source build failed.")
         print("Trying another candidate...")
         return False
     
@@ -485,6 +701,7 @@ def _try_install_command(
             text=True,
             capture_output=True,
             timeout=timeout,
+            env=os.environ,
         )
     except subprocess.TimeoutExpired:
         print(
@@ -639,6 +856,30 @@ def _add_identifier(store: Set[str], value: str) -> None:
     store.add(normalized.replace("_", ""))
 
 
+@lru_cache(maxsize=1)
+def _fetch_online_mappings() -> Dict[str, str]:
+    """Fetch a comprehensive module->package mapping from the web."""
+    mappings = {}
+    try:
+        # Use a short timeout to not slow down the tool too much
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        
+        with urllib.request.urlopen(MAPPING_URL, timeout=3, context=ctx) as response:
+            content = response.read().decode("utf-8")
+            for line in content.splitlines():
+                if ":" in line:
+                    parts = line.strip().split(":")
+                    if len(parts) >= 2:
+                        # pipreqs mapping format is module:package
+                        mappings[_normalized_key(parts[0])] = parts[1]
+    except Exception:
+        # Silently fail or print debug info if needed, but don't crash
+        pass
+    return mappings
+
+
 def _candidate_install_names(package: str) -> List[str]:
     names: List[str] = []
     seen: Set[str] = set()
@@ -655,6 +896,13 @@ def _candidate_install_names(package: str) -> List[str]:
     override = _PACKAGE_NAME_OVERRIDES.get(_normalized_key(package))
     if override:
         add(override)
+    
+    # Try online mappings
+    online_mappings = _fetch_online_mappings()
+    online_match = online_mappings.get(_normalized_key(package))
+    if online_match:
+        add(online_match)
+
     add(package)
     add(_normalize_import_name(package))
     add(package.replace("_", "-"))
