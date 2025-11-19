@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterable, List, Set
+from typing import Iterable, Iterator, List, Set, Tuple
 
 MISSING_DEP_CODE = "DEP001"
 
@@ -44,6 +46,13 @@ def main(argv: List[str] | None = None) -> None:
     print(f"Scanning '{project_root}' for missing dependencies...")
     report = _run_deptry_scan(project_root)
     missing_packages = _extract_missing_packages(report)
+    missing_packages, local_packages = _filter_local_packages(missing_packages, project_root)
+
+    if local_packages:
+        print(
+            "Ignoring locally provided packages: "
+            + ", ".join(sorted(local_packages))
+        )
 
     if not missing_packages:
         print("No missing dependencies found.")
@@ -124,3 +133,69 @@ def _add_dependency(package: str, project_root: Path) -> None:
     except subprocess.CalledProcessError as error:
         print(f"Failed to add '{package}': {error}")
         sys.exit(error.returncode)
+
+
+def _filter_local_packages(
+    packages: Iterable[str], project_root: Path
+) -> Tuple[Set[str], Set[str]]:
+    missing: Set[str] = set()
+    local: Set[str] = set()
+    for package in packages:
+        if _module_resides_in_project(package, project_root):
+            local.add(package)
+        else:
+            missing.add(package)
+    return missing, local
+
+
+def _module_resides_in_project(package: str, project_root: Path) -> bool:
+    normalized = package.replace("-", "_")
+    import_paths = _project_import_paths(project_root)
+    with _temporary_sys_path(import_paths):
+        try:
+            spec = importlib.util.find_spec(normalized)
+        except ModuleNotFoundError:
+            return False
+
+    if spec is None:
+        return False
+
+    origins: List[Path] = []
+    if spec.origin and spec.origin not in {"built-in", "frozen"}:
+        origins.append(Path(spec.origin))
+    if spec.submodule_search_locations:
+        origins.extend(Path(location) for location in spec.submodule_search_locations)
+
+    return any(_is_within_project(origin, project_root) for origin in origins)
+
+
+def _project_import_paths(project_root: Path) -> List[Path]:
+    paths = [project_root]
+    src_dir = project_root / "src"
+    if src_dir.is_dir():
+        paths.append(src_dir)
+    return paths
+
+
+@contextmanager
+def _temporary_sys_path(paths: Iterable[Path]) -> Iterator[None]:
+    inserted: List[str] = []
+    try:
+        for path in paths:
+            path_str = str(path)
+            if path_str not in sys.path:
+                sys.path.insert(0, path_str)
+                inserted.append(path_str)
+        yield
+    finally:
+        for path_str in inserted:
+            if path_str in sys.path:
+                sys.path.remove(path_str)
+
+
+def _is_within_project(path: Path, project_root: Path) -> bool:
+    try:
+        path.resolve().relative_to(project_root.resolve())
+        return True
+    except ValueError:
+        return False

@@ -30,8 +30,9 @@ deptry-auto --dry-run
 What happens:
 
 1. `deptry` runs with JSON output enabled (using `python -m deptry --json-output ...`).
-2. Any issues with code `DEP001` (missing dependency) are collected.
-3. Each missing package is added to the target project with `uv add <package>`.
+2. Any issues with code `DEP001` (missing dependency) are collected, and packages that already live inside the
+   project tree are ignored.
+3. Each remaining missing package is added to the target project with `uv add <package>`.
 
 `deptry` exits with code `1` when it finds issues, so `deptry-auto` tolerates both `0` (clean) and `1` (issues) but still halts for any other failure. Use `--dry-run` when you only need a report of the missing dependencies.
 
