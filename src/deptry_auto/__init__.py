@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 from pathlib import Path
 from typing import Dict, Iterable, Iterator, List, Set, Tuple
+from difflib import SequenceMatcher
 
 MISSING_DEP_CODE = "DEP001"
 PYPI_RPC_URL = "https://pypi.org/pypi"
@@ -68,6 +69,15 @@ def parse_args(argv: List[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Only print the dependencies that would be added.",
     )
+    parser.add_argument(
+        "--install-timeout",
+        type=int,
+        default=300,
+        help=(
+            "Maximum seconds to wait for a single 'uv add' command before moving "
+            "on (use 0 to disable)."
+        ),
+    )
     return parser.parse_args(argv)
 
 
@@ -107,6 +117,7 @@ def main(argv: List[str] | None = None) -> None:
 
     print(f"Found missing dependencies: {', '.join(sorted(missing_packages))}")
     failures: List[str] = []
+    install_timeout = args.install_timeout if args.install_timeout > 0 else None
     for package in sorted(missing_packages):
         if args.dry_run:
             install_name = _candidate_install_names(package)[0]
@@ -117,7 +128,7 @@ def main(argv: List[str] | None = None) -> None:
             else:
                 print(f"[dry-run] uv add {package}")
             continue
-        if not _add_dependency(package, project_root):
+        if not _add_dependency(package, project_root, install_timeout):
             failures.append(package)
 
     if args.dry_run:
@@ -187,18 +198,30 @@ def _extract_missing_packages(report: Iterable[dict]) -> Set[str]:
     return missing
 
 
-def _add_dependency(package: str, project_root: Path) -> bool:
+def _add_dependency(
+    package: str, project_root: Path, timeout: int | None
+) -> bool:
     print(f"Adding dependency '{package}' via uv...")
     candidates = _candidate_install_names(package)
     attempted: List[str] = []
     for candidate in candidates:
         attempted.append(candidate)
-        result = subprocess.run(
-            ["uv", "add", candidate],
-            cwd=project_root,
-            text=True,
-            capture_output=True,
-        )
+        try:
+            result = subprocess.run(
+                ["uv", "add", candidate],
+                cwd=project_root,
+                text=True,
+                capture_output=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as timeout_error:
+            _relay_timeout_output(timeout_error)
+            print(
+                f"Timed out after {timeout}s while installing '{candidate}'."
+                " Trying another candidate..."
+            )
+            continue
+
         _relay_process_output(result)
         if result.returncode == 0:
             if candidate != package:
@@ -404,16 +427,22 @@ def _search_pypi_candidates(term: str) -> Tuple[str, ...]:
     except xmlrpc.client.Error:
         return ()
 
-    def ordering(item: dict) -> int:
-        return int(item.get("_pypi_ordering", 0))
+    def score(item: dict) -> Tuple[float, int]:
+        name = (item.get("name") or "").casefold()
+        summary = (item.get("summary") or "").casefold()
+        similarity = SequenceMatcher(None, normalized.casefold(), name).ratio()
+        if normalized.casefold() in name:
+            similarity += 0.5
+        if normalized.casefold() in summary:
+            similarity += 0.25
+        ordering = int(item.get("_pypi_ordering", 0))
+        return similarity, ordering
 
-    sorted_hits = sorted(hits, key=ordering, reverse=True)
+    sorted_hits = sorted(hits, key=score, reverse=True)
     candidates: List[str] = []
     for item in sorted_hits:
         name = item.get("name")
         if not name:
-            continue
-        if normalized.casefold() not in name.casefold():
             continue
         candidates.append(name)
         if len(candidates) >= 5:
@@ -438,6 +467,13 @@ def _relay_process_output(result: subprocess.CompletedProcess[str]) -> None:
         print(result.stdout.rstrip())
     if result.stderr:
         print(result.stderr.rstrip(), file=sys.stderr)
+
+
+def _relay_timeout_output(error: subprocess.TimeoutExpired) -> None:
+    if error.output:
+        print(str(error.output).rstrip())
+    if error.stderr:
+        print(str(error.stderr).rstrip(), file=sys.stderr)
 
 
 def _project_import_paths(project_root: Path) -> List[Path]:

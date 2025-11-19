@@ -25,6 +25,9 @@ deptry-auto path/to/other-project
 
 # Preview the changes without modifying the project
 deptry-auto --dry-run
+
+# Wait up to 2 minutes per dependency install
+deptry-auto --install-timeout 120
 ```
 
 What happens:
@@ -38,6 +41,7 @@ What happens:
 
 - The installer automatically queries the PyPI XML-RPC API for likely package matches when an import name is missing (so `PIL` resolves to `Pillow`, `cv2` to `opencv-python`, and similar cases work without manual overrides).
 - Imports that only exist on MicroPython builds (`machine`, `micropython`, `rp2`, `ucollections`, `ujson`, `uselect`, `ustruct`, `utime`, `neopixel`) are skipped automatically.
+- Every `uv add` command is capped by `--install-timeout` (default 300s). When the timeout is reached, deptry-auto stops that attempt, switches to the next candidate name, and ultimately reports the packages that still need manual attention.
 - If one installation fails, `deptry-auto` now continues with the remaining packages, tries fallback names where applicable, and reports any failures at the end.
 
 `deptry` exits with code `1` when it finds issues, so `deptry-auto` tolerates both `0` (clean) and `1` (issues) but still halts for any other failure. Use `--dry-run` when you only need a report of the missing dependencies.
